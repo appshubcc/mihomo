@@ -89,7 +89,7 @@ func (vc *Conn) ReadBuffer(buffer *buf.Buffer) error {
 		vc.FilterTLS(readBuffer.Bytes())
 		if vc.readRemainingBuffer != nil {
 			innerErr := vc.ReadBuffer(buffer) // back to top but not losing err
-			if err != nil {
+			if err == nil {
 				err = innerErr
 			}
 		}
