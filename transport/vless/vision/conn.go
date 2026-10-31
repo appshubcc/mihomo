@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/metacubex/mihomo/common/buf"
@@ -31,6 +33,7 @@ type Conn struct {
 	input    *bytes.Reader // &tlsConn.input or nil
 	rawInput *bytes.Buffer // &tlsConn.rawInput or nil
 
+	filterLock                 sync.Mutex
 	packetsToFilter            int
 	isTLS                      bool
 	isTLS12orAbove             bool
@@ -43,8 +46,9 @@ type Conn struct {
 	readProcess                bool
 	readFilterUUID             bool
 	readLastCommand            byte
+	readDirect                 atomic.Bool
 	writeFilterApplicationData bool
-	writeDirect                bool
+	writeDirect                atomic.Bool
 	writeOnceUserUUID          []byte
 }
 
@@ -172,6 +176,7 @@ func (vc *Conn) ReadBuffer(buffer *buf.Buffer) error {
 			if vc.input == nil && vc.rawInput == nil {
 				vc.readProcess = false
 				vc.ExtendedReader = N.NewExtendedReader(vc.netConn)
+				vc.readDirect.Store(true)
 				log.Debugln("XTLS Vision direct read start")
 			}
 			if needReturn {
@@ -201,25 +206,26 @@ func (vc *Conn) WriteBuffer(buffer *buf.Buffer) (err error) {
 		}
 
 		vc.FilterTLS(buffer.Bytes())
+		isTLS, isTLS12orAbove, enableXTLS, packetsToFilter := vc.tlsState()
 		buffers := vc.ReshapeBuffer(buffer)
 		applyPadding := true
 		for i, buffer := range buffers {
 			command := commandPaddingContinue
 			if applyPadding {
-				if vc.isTLS && buffer.Len() > 6 && bytes.Equal(tlsApplicationDataStart, buffer.To(3)) {
+				if isTLS && buffer.Len() > 6 && bytes.Equal(tlsApplicationDataStart, buffer.To(3)) {
 					command = commandPaddingEnd
-					if vc.enableXTLS {
+					if enableXTLS {
 						command = commandPaddingDirect
-						vc.writeDirect = true
+						vc.writeDirect.Store(true)
 					}
 					vc.writeFilterApplicationData = false
 					applyPadding = false
-				} else if !vc.isTLS12orAbove && vc.packetsToFilter <= 1 {
+				} else if !isTLS12orAbove && packetsToFilter <= 1 {
 					command = commandPaddingEnd
 					vc.writeFilterApplicationData = false
 					applyPadding = false
 				}
-				ApplyPadding(buffer, command, &vc.writeOnceUserUUID, vc.isTLS)
+				ApplyPadding(buffer, command, &vc.writeOnceUserUUID, isTLS)
 			}
 
 			err = vc.ExtendedWriter.WriteBuffer(buffer)
@@ -243,7 +249,7 @@ func (vc *Conn) WriteBuffer(buffer *buf.Buffer) (err error) {
 
 func (vc *Conn) FrontHeadroom() int {
 	fontHeadroom := PaddingHeaderLen - uuid.Size
-	if vc.readFilterUUID || vc.writeOnceUserUUID != nil {
+	if vc.writeOnceUserUUID != nil {
 		fontHeadroom = PaddingHeaderLen
 	}
 	if vc.writeFilterApplicationData { // The writer may be replaced, add the required value for vc.netConn
@@ -273,8 +279,21 @@ func (vc *Conn) NeedAdditionalReadDeadline() bool {
 }
 
 func (vc *Conn) Upstream() any {
-	if vc.writeDirect ||
-		vc.readLastCommand == commandPaddingDirect {
+	if vc.readDirect.Load() || vc.writeDirect.Load() {
+		return vc.netConn
+	}
+	return vc.Conn
+}
+
+func (vc *Conn) UpstreamReader() any {
+	if vc.readDirect.Load() {
+		return vc.netConn
+	}
+	return vc.Conn
+}
+
+func (vc *Conn) UpstreamWriter() any {
+	if vc.writeDirect.Load() {
 		return vc.netConn
 	}
 	return vc.Conn
@@ -285,11 +304,7 @@ func (vc *Conn) ReaderPossiblyReplaceable() bool {
 }
 
 func (vc *Conn) ReaderReplaceable() bool {
-	if !vc.readProcess &&
-		vc.readLastCommand == commandPaddingDirect {
-		return true
-	}
-	return false
+	return vc.readDirect.Load()
 }
 
 func (vc *Conn) WriterPossiblyReplaceable() bool {
@@ -297,10 +312,7 @@ func (vc *Conn) WriterPossiblyReplaceable() bool {
 }
 
 func (vc *Conn) WriterReplaceable() bool {
-	if vc.writeDirect {
-		return true
-	}
-	return false
+	return vc.writeDirect.Load()
 }
 
 func (vc *Conn) Close() error {

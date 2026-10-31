@@ -27,7 +27,15 @@ const (
 	tlsHandshakeTypeServerHello byte = 0x02
 )
 
+func (vc *Conn) tlsState() (isTLS, isTLS12orAbove, enableXTLS bool, packetsToFilter int) {
+	vc.filterLock.Lock()
+	defer vc.filterLock.Unlock()
+	return vc.isTLS, vc.isTLS12orAbove, vc.enableXTLS, vc.packetsToFilter
+}
+
 func (vc *Conn) FilterTLS(buffer []byte) (index int) {
+	vc.filterLock.Lock()
+	defer vc.filterLock.Unlock()
 	if vc.packetsToFilter <= 0 {
 		return 0
 	}
